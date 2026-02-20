@@ -9,6 +9,8 @@ import (
 	"github.com/saravanan611/base/log"
 )
 
+// WorkerScall is a dynamic auto-scaling worker pool.
+// It scales up and down based on queue size.
 type WorkerScall[pJob, pExpected any] struct {
 	minWorker, maxWorker, clinetSize, scallPoint, currentEmp int
 	cancelFuncs                                              []context.CancelFunc
@@ -21,6 +23,17 @@ type WorkerScall[pJob, pExpected any] struct {
 	*time.Ticker
 }
 
+// CreateScall initializes a new auto-scaling worker pool.
+//
+// Parameters:
+//
+//	pScallCycle  - How often scaling check runs
+//	pMin         - Minimum workers
+//	pMax         - Maximum workers
+//	pQSize       - Queue size
+//	pScallPoint  - Scaling threshold (jobs per worker)
+//	pFunc        - Job processing function
+//	pExpectedFlab - Enable progress channel
 func CreateScall[pJob, pExpected any](pScallCycle time.Duration, pMin, pMax, pQSize, pScallPoint int, pFunc func(pJob) pExpected, pExpectedFlab bool) (lWorkerRec *WorkerScall[pJob, pExpected], lErr error) {
 	log.Info("CreateScall (+)")
 	if pMin < 1 {
@@ -62,6 +75,7 @@ func CreateScall[pJob, pExpected any](pScallCycle time.Duration, pMin, pMax, pQS
 	return
 }
 
+// Do submits a job into the worker queue.
 func (pWorkerRec *WorkerScall[pJob, pExpected]) Do(pWork pJob) {
 	// log.Info("Do (+)")
 	pWorkerRec.job <- pWork
@@ -69,6 +83,8 @@ func (pWorkerRec *WorkerScall[pJob, pExpected]) Do(pWork pJob) {
 	// log.Info("Do (-)")
 }
 
+// IsSpaceIn checks whether there is space in queue
+// considering both queued jobs and active workers.
 func (pWorkerRec *WorkerScall[pJob, pExpected]) IsSpaceIn() bool {
 	// log.Info("IsSpaceIn (+)")
 	// log.Info("IsSpaceIn (-)")
@@ -86,6 +102,7 @@ func (pWorkerRec *WorkerScall[pJob, pExpected]) start() {
 	log.Info("start (-)")
 }
 
+// Stop gracefully shuts down the worker pool.
 func (pWorkerRec *WorkerScall[pJob, pExpected]) Stop() {
 	log.Info("Stop (+)")
 	pWorkerRec.Wait()
