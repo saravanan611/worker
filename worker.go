@@ -16,7 +16,7 @@ type WorkerScall[pJob, pExpected any] struct {
 	cancelFuncs                                              []context.CancelFunc
 	job                                                      chan pJob
 	do                                                       func(pJob) pExpected
-	progress                                                 chan pExpected
+	Progress                                                 chan pExpected
 	progressFlag                                             bool
 	*sync.WaitGroup
 	time.Duration
@@ -67,7 +67,7 @@ func CreateScall[pJob, pExpected any](pScallCycle time.Duration, pMin, pMax, pQS
 		Duration:   pScallCycle,
 	}
 	if pExpectedFlab {
-		lWorkerRec.progress = make(chan pExpected, pQSize*2)
+		lWorkerRec.Progress = make(chan pExpected, pQSize*2)
 		lWorkerRec.progressFlag = true
 	}
 	go lWorkerRec.start()
@@ -114,7 +114,7 @@ func (pWorkerRec *WorkerScall[pJob, pExpected]) Stop() {
 	}
 	close(pWorkerRec.job)
 	if pWorkerRec.progressFlag {
-		close(pWorkerRec.progress)
+		close(pWorkerRec.Progress)
 	}
 
 	log.Info("Stop (-)")
@@ -158,7 +158,7 @@ func (pWorkerRec *WorkerScall[pJob, pExpected]) worker(pCtx context.Context, pEm
 			log.SetRequestID(uuid.NewString())
 			lResp := pWorkerRec.do(lJob)
 			if pWorkerRec.progressFlag {
-				pWorkerRec.progress <- lResp
+				pWorkerRec.Progress <- lResp
 			}
 			pWorkerRec.Done()
 		}
