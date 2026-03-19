@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -10,158 +11,268 @@ import (
 )
 
 // WorkerScall is a dynamic auto-scaling worker pool.
-// It scales up and down based on queue size.
+// It scales up and down based on queue size relative to scallPoint.
+//
+// Thread safety: all mutable fields are protected by mu.
 type WorkerScall[pJob, pExpected any] struct {
-	minWorker, maxWorker, clinetSize, scallPoint, currentEmp int
-	cancelFuncs                                              []context.CancelFunc
-	job                                                      chan pJob
-	do                                                       func(pJob) pExpected
-	Progress                                                 chan pExpected
-	progressFlag                                             bool
-	*sync.WaitGroup
-	time.Duration
-	*time.Ticker
+	// immutable after creation — safe to read without lock
+	minWorker  int
+	maxWorker  int
+	clientSize int
+	scallPoint int
+	do         func(pJob) pExpected
+
+	// channels — created once, safe to read/write concurrently
+	job      chan pJob
+	Progress chan pExpected
+	stopCh   chan struct{}
+
+	progressFlag bool
+
+	// mutable state — must hold mu to read or write
+	mu          sync.Mutex
+	cancelFuncs []context.CancelFunc
+	currentEmp  int
+
+	// WaitGroup tracks in-flight jobs (Add before send, Done after process)
+	wg sync.WaitGroup
+
+	// ticker owned by start(); stopped via stopCh
+	ticker   *time.Ticker
+	duration time.Duration
 }
 
-// CreateScall initializes a new auto-scaling worker pool.
+// CreateScall initialises a new auto-scaling worker pool and immediately
+// starts minWorker workers so jobs can be processed without waiting for
+// the first scale tick.
 //
 // Parameters:
 //
-//	pScallCycle  - How often scaling check runs
-//	pMin         - Minimum workers
-//	pMax         - Maximum workers
-//	pQSize       - Queue size
-//	pScallPoint  - Scaling threshold (jobs per worker)
-//	pFunc        - Job processing function
-//	pExpectedFlab - Enable progress channel
-func CreateScall[pJob, pExpected any](pScallCycle time.Duration, pMin, pMax, pQSize, pScallPoint int, pFunc func(pJob) pExpected, pExpectedFlab bool) (lWorkerRec *WorkerScall[pJob, pExpected], lErr error) {
+//	pScallCycle   – How often the scaling check runs (minimum 5 s)
+//	pMin          – Minimum number of workers (≥ 1)
+//	pMax          – Maximum number of workers (> pMin)
+//	pQSize        – Job queue buffer size (≥ 100)
+//	pScallPoint   – Jobs-per-worker threshold that triggers scale-up/down (10 ≤ x ≤ pQSize/2)
+//	pFunc         – Job processing function
+//	pProgressFlag – When true, results are forwarded to the Progress channel
+func CreateScall[pJob, pExpected any](pScallCycle time.Duration, pMin, pMax, pQSize, pScallPoint int, pFunc func(pJob) pExpected, pProgressFlag bool) (*WorkerScall[pJob, pExpected], error) {
 	log.Info("CreateScall (+)")
+
 	if pMin < 1 {
-		return nil, log.Error("min requed 1 worker")
+		return nil, fmt.Errorf("min must be at least 1 worker")
 	}
-
 	if pMax <= pMin {
-		return nil, log.Error("max is greater then min val")
+		return nil, fmt.Errorf("max (%d) must be greater than min (%d)", pMax, pMin)
 	}
-
 	if pQSize < 100 {
-		return nil, log.Error("q-size must be greater then 10")
+		return nil, fmt.Errorf("queue size must be at least 100 (got %d)", pQSize)
 	}
-
 	if pScallPoint < 10 || pScallPoint > pQSize/2 {
-		return nil, log.Error("scall-up point is greater then 10 and less then q-size/2")
+		return nil, fmt.Errorf("scallPoint must be between 10 and qSize/2 (%d), got %d", pQSize/2, pScallPoint)
 	}
-
 	if pScallCycle < 5*time.Second {
-		return nil, log.Error("scall up time must be greater then or eq to 5 sec")
+		return nil, fmt.Errorf("scallCycle must be >= 5s (got %s)", pScallCycle)
 	}
 
-	lWorkerRec = &WorkerScall[pJob, pExpected]{
+	w := &WorkerScall[pJob, pExpected]{
 		minWorker:  pMin,
 		maxWorker:  pMax,
-		clinetSize: pQSize,
+		clientSize: pQSize,
 		scallPoint: pScallPoint,
 		do:         pFunc,
 		job:        make(chan pJob, pQSize),
-		WaitGroup:  &sync.WaitGroup{},
-		Duration:   pScallCycle,
+		stopCh:     make(chan struct{}),
+		duration:   pScallCycle,
 	}
-	if pExpectedFlab {
-		lWorkerRec.Progress = make(chan pExpected, pQSize*2)
-		lWorkerRec.progressFlag = true
+
+	if pProgressFlag {
+		w.Progress = make(chan pExpected, pQSize*2)
+		w.progressFlag = true
 	}
-	go lWorkerRec.start()
+
+	// Spawn the minimum number of workers immediately so the pool is
+	// ready to process jobs before the first scale tick fires.
+	for range pMin {
+		w.spawnWorker()
+	}
+
+	go w.start()
+
 	log.Info("CreateScall (-)")
-	return
+	return w, nil
 }
 
-// Do submits a job into the worker queue.
-func (pWorkerRec *WorkerScall[pJob, pExpected]) Do(pWork pJob) {
-	// log.Info("Do (+)")
-	pWorkerRec.job <- pWork
-	pWorkerRec.Add(1)
-	// log.Info("Do (-)")
+// Do submits a job to the worker pool.
+// Blocks if the internal queue is full.
+// wg.Add must happen before the send so Stop/Wait never races with Done.
+func (w *WorkerScall[pJob, pExpected]) Do(job pJob) {
+	w.wg.Add(1)
+	w.job <- job
 }
 
-// IsSpaceIn checks whether there is space in queue
-// considering both queued jobs and active workers.
-func (pWorkerRec *WorkerScall[pJob, pExpected]) IsSpaceIn() bool {
-	// log.Info("IsSpaceIn (+)")
-	// log.Info("IsSpaceIn (-)")
-	return (len(pWorkerRec.job) + pWorkerRec.currentEmp) < pWorkerRec.clinetSize
+// IsSpaceIn reports whether there is room in the job queue.
+func (w *WorkerScall[pJob, pExpected]) IsSpaceIn() bool {
+	return len(w.job) < w.clientSize
 }
 
-func (pWorkerRec *WorkerScall[pJob, pExpected]) start() {
-	pWorkerRec.Ticker = time.NewTicker(pWorkerRec.Duration)
-	log.Info("start (+)")
-	for range pWorkerRec.Ticker.C {
-
-		pWorkerRec.scallup()
-		pWorkerRec.scallDown()
-	}
-	log.Info("start (-)")
+// Wait blocks until every submitted job has been processed.
+func (w *WorkerScall[pJob, pExpected]) Wait() {
+	w.wg.Wait()
 }
 
-// Stop gracefully shuts down the worker pool.
-func (pWorkerRec *WorkerScall[pJob, pExpected]) Stop() {
+// Stop gracefully shuts down the pool:
+//  1. Waits for all in-flight jobs to finish.
+//  2. Signals the scale loop to exit.
+//  3. Cancels all worker goroutines.
+//  4. Closes channels.
+func (w *WorkerScall[pJob, pExpected]) Stop() {
 	log.Info("Stop (+)")
-	pWorkerRec.Wait()
-	if pWorkerRec.Ticker != nil {
-		pWorkerRec.Ticker.Stop()
+
+	// 1. Wait for every submitted job to be processed.
+	w.wg.Wait()
+
+	// 2. Stop the scaling loop.
+	close(w.stopCh)
+
+	// 3. Cancel all worker goroutines.
+	w.mu.Lock()
+	for _, cancel := range w.cancelFuncs {
+		cancel()
 	}
-	for _, lClose := range pWorkerRec.cancelFuncs {
-		lClose()
-	}
-	close(pWorkerRec.job)
-	if pWorkerRec.progressFlag {
-		close(pWorkerRec.Progress)
+	w.cancelFuncs = nil
+	w.currentEmp = 0
+	w.mu.Unlock()
+
+	// 4. Close channels (no more sends will happen).
+	close(w.job)
+	if w.progressFlag {
+		close(w.Progress)
 	}
 
 	log.Info("Stop (-)")
-
 }
 
-func (pWorkerRec *WorkerScall[pJob, pExpected]) scallup() {
-	lCur := int(len(pWorkerRec.job) / pWorkerRec.scallPoint)
-	if lCur < pWorkerRec.maxWorker && lCur > pWorkerRec.currentEmp && pWorkerRec.currentEmp < pWorkerRec.maxWorker {
-		log.Info("scallup (+)")
-		lCtx, lClear := context.WithCancel(context.Background())
+// --------------------------------------------------------------------
+// internal helpers
+// --------------------------------------------------------------------
 
-		go pWorkerRec.worker(lCtx, pWorkerRec.currentEmp+1)
-		pWorkerRec.cancelFuncs = append(pWorkerRec.cancelFuncs, lClear)
-		pWorkerRec.currentEmp++
-		log.Info("scallup (-)")
-	}
+// spawnWorker creates one new worker goroutine and registers its cancel func.
+// Caller must NOT hold mu — this function acquires it internally.
+func (w *WorkerScall[pJob, pExpected]) spawnWorker() {
+	ctx, cancel := context.WithCancel(context.Background())
 
+	w.mu.Lock()
+	empID := w.currentEmp + 1
+	w.cancelFuncs = append(w.cancelFuncs, cancel)
+	w.currentEmp++
+	w.mu.Unlock()
+
+	go w.worker(ctx, empID)
 }
 
-func (pWorkerRec *WorkerScall[pJob, pExpected]) scallDown() {
-	if int(len(pWorkerRec.job)/pWorkerRec.scallPoint) < pWorkerRec.currentEmp && pWorkerRec.currentEmp > pWorkerRec.minWorker {
-		log.Info("scallDown (+)")
-		lLeastWorker := pWorkerRec.cancelFuncs[len(pWorkerRec.cancelFuncs)-1]
-		lLeastWorker()
-		pWorkerRec.cancelFuncs = pWorkerRec.cancelFuncs[:len(pWorkerRec.cancelFuncs)-1]
-		pWorkerRec.currentEmp--
-		log.Info("scallDown (-)")
-	}
+// cancelLastWorker cancels the most-recently-spawned worker and removes it
+// from the tracking slice.
+// Caller must NOT hold mu — this function acquires it internally.
+func (w *WorkerScall[pJob, pExpected]) cancelLastWorker() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
+	last := w.cancelFuncs[len(w.cancelFuncs)-1]
+	last()
+	w.cancelFuncs = w.cancelFuncs[:len(w.cancelFuncs)-1]
+	w.currentEmp--
 }
 
-func (pWorkerRec *WorkerScall[pJob, pExpected]) worker(pCtx context.Context, pEmpID int) {
-	log.Info("worker %d (+)", pEmpID)
+// start runs the periodic scale loop until Stop signals via stopCh.
+func (w *WorkerScall[pJob, pExpected]) start() {
+	w.ticker = time.NewTicker(w.duration)
+	defer w.ticker.Stop()
+
+	log.Info("start (+)")
 	for {
 		select {
-		case <-pCtx.Done():
-			log.Info("worker %d (-)", pEmpID)
+		case <-w.stopCh:
+			log.Info("start (-)")
 			return
-		case lJob := <-pWorkerRec.job:
-			log.SetRequestID(uuid.NewString())
-			lResp := pWorkerRec.do(lJob)
-			if pWorkerRec.progressFlag {
-				pWorkerRec.Progress <- lResp
-			}
-			pWorkerRec.Done()
+		case <-w.ticker.C:
+			w.scaleUp()
+			w.scaleDown()
 		}
 	}
+}
 
+// scaleUp spawns additional workers when the queue depth warrants it.
+// It may spawn more than one worker per tick if the backlog is large.
+func (w *WorkerScall[pJob, pExpected]) scaleUp() {
+	for {
+		qLen := len(w.job)
+
+		// desired = how many workers the current queue depth needs
+		desired := qLen / w.scallPoint
+		if desired < w.minWorker {
+			desired = w.minWorker
+		}
+		if desired > w.maxWorker {
+			desired = w.maxWorker
+		}
+
+		w.mu.Lock()
+		cur := w.currentEmp
+		w.mu.Unlock()
+
+		if cur >= desired || cur >= w.maxWorker {
+			break
+		}
+
+		log.Info("scaleUp: spawning worker (cur=%d desired=%d)", cur, desired)
+		w.spawnWorker()
+	}
+}
+
+// scaleDown cancels surplus workers when the queue no longer justifies them.
+func (w *WorkerScall[pJob, pExpected]) scaleDown() {
+	for {
+		qLen := len(w.job)
+
+		// desired = minimum workers needed right now
+		desired := qLen / w.scallPoint
+		if desired < w.minWorker {
+			desired = w.minWorker
+		}
+
+		w.mu.Lock()
+		cur := w.currentEmp
+		w.mu.Unlock()
+
+		if cur <= desired || cur <= w.minWorker {
+			break
+		}
+
+		log.Info("scaleDown: cancelling worker (cur=%d desired=%d)", cur, desired)
+		w.cancelLastWorker()
+	}
+}
+
+// worker processes jobs from the shared channel until its context is cancelled.
+func (w *WorkerScall[pJob, pExpected]) worker(ctx context.Context, empID int) {
+	log.Info("worker %d (+)", empID)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("worker %d (-)", empID)
+			return
+		case job, ok := <-w.job:
+			if !ok {
+				// Channel closed — pool is shutting down.
+				log.Info("worker %d: job channel closed, exiting", empID)
+				return
+			}
+			log.SetRequestID(uuid.NewString())
+			result := w.do(job)
+			if w.progressFlag {
+				w.Progress <- result
+			}
+			w.wg.Done()
+		}
+	}
 }
