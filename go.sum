@@ -1,4 +1,2 @@
-github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
-github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/saravanan611/base v0.0.0-20260129181559-d691b322373b h1:bJilmxpJ6rrik8H/RLQPUFtJQXHLdbeTgNICZMadMwI=
-github.com/saravanan611/base v0.0.0-20260129181559-d691b322373b/go.mod h1:hskrACXCh8IdPxEowXR0cBYAWwZAhsxw89cgRYwJPFw=
+github.com/saravanan611/log v0.0.0-20260324180546-0c8a7cb34d2c h1:jGEuEZx8Wf+7StofVu9ckTP+N7z44F/ky9cXDyz6nXE=
+github.com/saravanan611/log v0.0.0-20260324180546-0c8a7cb34d2c/go.mod h1:uT2ctPWDdq35XWb4iqHNMvaUV32eba+vyN8BT4qHpbM=

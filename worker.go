@@ -6,8 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/saravanan611/base/log"
+	"github.com/saravanan611/log"
 )
 
 // WorkerScall is a dynamic auto-scaling worker pool.
@@ -235,10 +234,7 @@ func (w *WorkerScall[pJob, pExpected]) scaleDown() {
 		qLen := len(w.job)
 
 		// desired = minimum workers needed right now
-		desired := qLen / w.scallPoint
-		if desired < w.minWorker {
-			desired = w.minWorker
-		}
+		desired := max(qLen/w.scallPoint, w.minWorker)
 
 		w.mu.Lock()
 		cur := w.currentEmp
@@ -267,7 +263,7 @@ func (w *WorkerScall[pJob, pExpected]) worker(ctx context.Context, empID int) {
 				log.Info("worker %d: job channel closed, exiting", empID)
 				return
 			}
-			log.SetRequestID(uuid.NewString())
+			// log.SetRequestID(uuid.NewString())
 			result := w.do(job)
 			if w.progressFlag {
 				w.Progress <- result
